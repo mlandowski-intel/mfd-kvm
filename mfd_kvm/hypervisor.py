@@ -891,16 +891,41 @@ class KVMHypervisor:
         :param timeout: Time to clone image
         :raises KVMHypervisorException: if cloning failed or timeout occurred
         :raises FileNotFoundError: if not found path_to_source_image
-        :return: Path for cloned hdd image
+        :return: Path for cloned or already matching hdd image
         """
+        path_to_source_image = self._conn.path(str(path_to_source_image))
+        path_to_destination_image = self._conn.path(str(path_to_destination_image))
         logger.log(
             log_levels.MODULE_DEBUG,
             msg=f"Cloning disk image {path_to_source_image} into {path_to_destination_image}, "
             f"timeout - {timeout} secs.",
         )
         if path_to_source_image.is_file():
+            if path_to_destination_image.exists():
+                source_checksum_path = path_to_source_image.parent / f"{path_to_source_image.name}.md5"
+                if source_checksum_path.is_file():
+                    checksum_file_content = source_checksum_path.read_text().strip()
+                    source_checksum = checksum_file_content.split(maxsplit=1)[0] if checksum_file_content else ""
+                else:
+                    source_checksum = self._conn.execute_command(f"md5sum {path_to_source_image}").stdout.split()[0]
+                destination_checksum = self._conn.execute_command(f"md5sum {path_to_destination_image}").stdout.split()[
+                    0
+                ]
+                if source_checksum.lower() == destination_checksum.lower():
+                    logger.log(
+                        log_levels.MODULE_DEBUG,
+                        msg=f"Destination image {path_to_destination_image} already matches the source; "
+                        "skipping cloning.",
+                    )
+                    return path_to_destination_image
+                logger.log(
+                    log_levels.MODULE_DEBUG,
+                    msg=f"Destination image {path_to_destination_image} differs from the source; removing it.",
+                )
+                path_to_destination_image.unlink()
+
             timeout_counter = TimeoutCounter(timeout)
-            copy_command = "rsync -aqc" if self._rsync_available else "scp"
+            copy_command = "rsync -aq" if self._rsync_available else "scp"
             # show 5 column of ls, size of file
             target_size = self._conn.execute_command(
                 f"ls {path_to_source_image} -l | awk '{{print $5}}'", shell=True
@@ -921,10 +946,15 @@ class KVMHypervisor:
                     if path_to_destination_image.exists()
                     else 0
                 )
-                logging.log(
-                    log_levels.MODULE_DEBUG,
-                    msg=f"still cloning... {int(current_size) / int(target_size) * 100:.0f} %, next check in 30secs.",
-                )
+                try:
+                    current_size = int(current_size)
+                except (TypeError, ValueError):
+                    current_size = 0
+                if current_size > 0:
+                    logging.log(
+                        log_levels.MODULE_DEBUG,
+                        msg=f"still cloning... {current_size / int(target_size) * 100:.0f} %, next check in 30secs.",
+                    )
                 sleep(30)
             else:
                 raise KVMHypervisorException(
